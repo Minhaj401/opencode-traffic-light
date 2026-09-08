@@ -1,0 +1,16 @@
+#!/bin/sh
+# traffic-light start|stop|restart|status|logs
+# Easy switch for the opencode traffic-light widget (systemd user service).
+set -e
+SVC=opencode-traffic-light.service
+case "${1:-status}" in
+  start)   systemctl --user start $SVC ;;
+  stop)    systemctl --user stop $SVC ;;
+  restart) systemctl --user restart $SVC ;;
+  enable)  systemctl --user enable --now $SVC ;;
+  disable) systemctl --user disable --now $SVC ;;
+  logs)    journalctl --user -u $SVC -n 30 --no-pager ;;
+  status|*) systemctl --user is-active $SVC >/dev/null 2>&1 \
+             && echo "running ($(systemctl --user show $SVC -p MainPID --value))" \
+             || echo "stopped" ;;
+esac

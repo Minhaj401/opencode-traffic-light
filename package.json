@@ -1,0 +1,8 @@
+{
+  "name": "traffic-light-opencode-plugin",
+  "version": "0.1.0",
+  "description": "Serves opencode session state for the desktop traffic-light widget",
+  "type": "module",
+  "main": "traffic-light.js",
+  "private": true
+}
