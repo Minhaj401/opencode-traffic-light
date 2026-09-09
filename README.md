@@ -10,6 +10,8 @@ Only the live lamp glows. Drag it anywhere: parked near the left/right
 screen edge it rotates vertical (30×150) and welds flush to the edge;
 drag it back and it goes horizontal again (150×30). Right-click quits.
 
+<video src="demo.mp4" controls width="600"></video>
+
 ## How it works
 
 Two parts, one channel:
