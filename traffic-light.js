@@ -136,7 +136,6 @@ export const TrafficLightPlugin = async (ctx) => {
     "tool.execute.before": async (input) => {
       const sid =
         (input && (input.sessionID || input.sessionId)) || "global";
-      // the question tool blocks for user input: any question is red
       const tool = (input && input.tool) || "";
       await set(sid, /question|ask|input|prompt|confirm/i.test(tool) ? "red" : "yellow");
     },
