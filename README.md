@@ -10,7 +10,7 @@ Only the live lamp glows. Drag it anywhere: parked near the left/right
 screen edge it rotates vertical (30×150) and welds flush to the edge;
 drag it back and it goes horizontal again (150×30). Right-click quits.
 
-demo.mp4
+![demo](demo.gif)
 
 ## How it works
 
