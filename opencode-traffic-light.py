@@ -142,7 +142,10 @@ class Notch(Gtk.Window):
         h = widget.get_allocated_height()
         # lamp order follows the rotation: the red end of the horizontal bar
         # swings up on the right edge, down on the left edge
-        order = ("red", "yellow", "green") if self.orient != "left" else ("green", "yellow", "red")
+        if self.orient == "top":
+            order = ("red", "yellow", "green")
+        else:
+            order = ("red", "yellow", "green")
 
         if self.orient != "top":
             # vertical pill, three lamps top to bottom
