@@ -5,9 +5,8 @@ PartOf=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /home/minhaj/projects/opencode-traffic-light/opencode-traffic-light.py
-Restart=always
-RestartSec=3
+ExecStart=@PYTHON@ @WIDGET@
+Restart=no
 Environment=DISPLAY=:0
 
 [Install]
