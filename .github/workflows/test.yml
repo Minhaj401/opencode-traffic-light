@@ -1,0 +1,53 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Check shell syntax
+        run: |
+          sh -n setup.sh
+          sh -n traffic-light
+      - name: Check plugin syntax
+        run: |
+          node --check traffic-light.js
+          node --check traffic-light-launcher.js
+      - name: Test runtime components
+        run: node --experimental-vm-modules --test tests/*.test.js
+      - name: Build and test native widget
+        if: runner.os == 'macOS' && hashFiles('opencode-traffic-light.swift') != '' && hashFiles('tests/macos-widget.swift') != ''
+        run: |
+          set -eu
+          TMPDIR=$(mktemp -d "${TMPDIR:-/tmp}/traffic-light.XXXXXX")
+          trap 'rm -rf "$TMPDIR"' EXIT
+          MACOSX_DEPLOYMENT_TARGET=12.0 xcrun swiftc -O -parse-as-library \
+            -warnings-as-errors opencode-traffic-light.swift \
+            -o "$TMPDIR/opencode-traffic-light"
+          xcrun swiftc -parse-as-library -warnings-as-errors -D WIDGET_TESTING \
+            opencode-traffic-light.swift tests/macos-widget.swift \
+            -o "$TMPDIR/traffic-light-tests" && "$TMPDIR/traffic-light-tests"
+      - name: Test isolated installer, CLI, and GTK widget
+        run: python3 -B -m unittest discover -s tests -p 'test_*.py' -v
+      - name: Check whitespace
+        run: git diff --check
