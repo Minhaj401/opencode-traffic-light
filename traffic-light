@@ -1,16 +1,99 @@
 #!/bin/sh
 # traffic-light start|stop|restart|status|logs
-# Easy switch for the opencode traffic-light widget (systemd user service).
+# Controls the per-user widget service on macOS (launchd) or Linux (systemd).
 set -e
-SVC=opencode-traffic-light.service
-case "${1:-status}" in
-  start)   systemctl --user start $SVC ;;
-  stop)    systemctl --user stop $SVC ;;
-  restart) systemctl --user restart $SVC ;;
-  enable)  systemctl --user enable --now $SVC ;;
-  disable) systemctl --user disable --now $SVC ;;
-  logs)    journalctl --user -u $SVC -n 30 --no-pager ;;
-  status|*) systemctl --user is-active $SVC >/dev/null 2>&1 \
-             && echo "running ($(systemctl --user show $SVC -p MainPID --value))" \
-             || echo "stopped" ;;
+ACTION=${1:-status}
+case "$ACTION" in
+  start|stop|restart|enable|disable|logs|status|autostart) ;;
+  *) echo "Usage: traffic-light start|stop|restart|status|logs|enable|disable" >&2; exit 1 ;;
+esac
+
+OS=$(uname -s)
+case "$OS" in
+  Darwin|Linux) ;;
+  *) echo "Unsupported platform (expected macOS or Linux)" >&2; exit 1 ;;
+esac
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/opencode-traffic-light"
+case "$ACTION" in
+  autostart)
+    # Called once by each OpenCode process, never by its status heartbeats.
+    if [ -e "$STATE_DIR/disabled" ]; then exit 0; fi
+    ACTION=start
+    ;;
+  enable) rm -f "$STATE_DIR/disabled" ;;
+  disable)
+    mkdir -p "$STATE_DIR"
+    : > "$STATE_DIR/disabled"
+    ;;
+esac
+
+case "$OS" in
+  Darwin)
+    LABEL=com.opencode.traffic-light
+    DOMAIN="gui/$(id -u)"
+    TARGET="$DOMAIN/$LABEL"
+    PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+    case "$ACTION" in
+      start|restart|enable)
+        if [ ! -f "$PLIST" ]; then
+          echo "Widget not installed. Run ./setup.sh first." >&2
+          exit 1
+        fi
+        if [ "$ACTION" = enable ]; then
+          launchctl enable "$TARGET"
+        fi
+        if ! launchctl print "$TARGET" >/dev/null 2>&1; then
+          # Another OpenCode process may have loaded the same agent meanwhile.
+          if ! launchctl bootstrap "$DOMAIN" "$PLIST" && ! launchctl print "$TARGET" >/dev/null 2>&1; then
+            echo "Could not load widget. Run from a macOS desktop login; if disabled, use traffic-light enable." >&2
+            exit 1
+          fi
+        fi
+        if [ "$ACTION" = restart ]; then
+          launchctl kickstart -k "$TARGET"
+        else
+          launchctl kickstart "$TARGET"
+        fi
+        ;;
+      stop|disable)
+        if [ "$ACTION" = disable ]; then
+          launchctl disable "$TARGET"
+        fi
+        if launchctl print "$TARGET" >/dev/null 2>&1; then
+          launchctl bootout "$TARGET"
+        fi
+        ;;
+      logs)
+        LOG_DIR="$HOME/Library/Logs/opencode-traffic-light"
+        for log in "$LOG_DIR/stdout.log" "$LOG_DIR/stderr.log"; do
+          if [ -f "$log" ]; then
+            echo "== $log =="
+            tail -n 30 "$log"
+          fi
+        done
+        ;;
+      status)
+        INFO=$(launchctl print "$TARGET" 2>/dev/null) || INFO=
+        PID=$(printf '%s\n' "$INFO" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)[[:space:]]*$/\1/p')
+        if [ -n "$PID" ]; then
+          echo "running ($PID)"
+        else
+          echo "stopped"
+        fi
+        ;;
+    esac
+    ;;
+  Linux)
+    SVC=opencode-traffic-light.service
+    case "$ACTION" in
+      start|stop|restart) systemctl --user "$ACTION" "$SVC" ;;
+      enable) systemctl --user start "$SVC" ;;
+      disable) systemctl --user disable --now "$SVC" ;;
+      logs) journalctl --user -u "$SVC" -n 30 --no-pager ;;
+      status) systemctl --user is-active "$SVC" >/dev/null 2>&1 \
+                && echo "running ($(systemctl --user show "$SVC" -p MainPID --value))" \
+                || echo "stopped" ;;
+    esac
+    ;;
 esac
