@@ -228,7 +228,7 @@ test("startup binds loopback before one absolute-path autostart and unrefs handl
   assert.deepEqual(p.execs[0].options, { timeout: 3000 });
   assert.equal(p.server.unrefs, 1);
   const [interval] = w.timers.filter((t) => t.interval);
-  assert.equal(interval.delay, 1000);
+  assert.equal(interval.delay, 250);
   assert.equal(interval.unrefs, 1);
   const [child] = p.children;
   for (const h of [child, child.stdin, child.stdout, child.stderr]) assert.equal(h.unrefs, 1);
@@ -475,7 +475,7 @@ test("multiple processes send full periodic snapshots without sharing session ow
   assert.deepEqual(peer.requests.at(-1).body.sessions, {});
   assert.equal(await w.state(), "yellow");
   const count = other.requests.length;
-  await w.advance(999);
+  await w.advance(249);
   assert.equal(other.requests.length, count);
   await w.advance(1);
   assert.equal(other.requests.length, count + 1);

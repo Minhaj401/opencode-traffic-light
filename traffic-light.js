@@ -31,6 +31,9 @@ import { join } from "node:path";
 
 const PORT = 4390;
 const COLORS = new Set(["green", "yellow", "red"]);
+// Snapshot tick: peers publish full state this often; the widget polls every
+// 400 ms, so end-to-end lag stays well under a second.
+const HEARTBEAT_MS = 250;
 // Match whole tool-name tokens: "task" contains "ask" but is not an input prompt.
 // V2 renamed the task tool to "subagent"; track both names.
 const TASK_TOOLS = new Set(["task", "subagent"]);
@@ -45,6 +48,7 @@ const legacyStates = new Map();
 let initialized = false;
 let serving = false;
 let inFlight = false;
+let queued = false;
 let server = null;
 
 function expirePeers() {
@@ -176,6 +180,7 @@ function ensureServer() {
 async function heartbeat() {
   if (inFlight) return;
   inFlight = true;
+  queued = false;
   try {
     expirePeers();
     if (ensureServer()) return;
@@ -190,11 +195,18 @@ async function heartbeat() {
     // The next tick retries ownership and publishes the latest local snapshot.
   } finally {
     inFlight = false;
+    if (queued) {
+      queued = false;
+      void heartbeat();
+    }
   }
 }
 
 function set(sid, color) {
   localStates.set(sid || "global", color);
+  // A change landed: retry once any in-flight snapshot finishes instead of
+  // waiting for the next tick.
+  queued = true;
   void heartbeat();
 }
 
@@ -251,7 +263,7 @@ async function setup(ctx) {
     initialized = true;
     void heartbeat();
     try {
-      const timer = setInterval(heartbeat, 1000);
+      const timer = setInterval(heartbeat, HEARTBEAT_MS);
       if (timer && typeof timer.unref === "function") timer.unref();
     } catch {}
     if (process.platform === "darwin" || process.platform === "linux") {

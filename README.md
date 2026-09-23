@@ -183,8 +183,9 @@ The plugin serves `GET /status` at `127.0.0.1:4390`, returning
 Widgets poll every 400 ms with a one-second timeout. Invalid responses retain the
 last color during the five-second disconnect grace period.
 
-One process owns the port; peers publish full snapshots every second through
-`POST /heartbeat`. Snapshots expire after four seconds, and surviving processes
+One process owns the port; peers publish full snapshots every 250 ms through
+`POST /heartbeat`, and any state change triggers an immediate publish (retrying
+once after an in-flight snapshot instead of waiting for the next tick). Snapshots expire after four seconds, and surviving processes
 can take ownership without waiting for a new task event. Legacy `POST /event`
 clients remain supported, but their lifetimes are not tracked; restart all backends
 after updating to use the current protocol.
