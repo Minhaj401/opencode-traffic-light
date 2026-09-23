@@ -48,21 +48,31 @@ mkdir -p "$HOME/.local/bin"
 ln -sf "$SOURCE_DIR/traffic-light" "$HOME/.local/bin/traffic-light"
 echo "  linked ~/.local/bin/traffic-light (ensure ~/.local/bin is on PATH)"
 
-echo "== 3. opencode plugin =="
-# Keep the path registered by older installers; new installs use auto-discovery.
-PLUGIN_DIR="$CONFIG_DIR/plugins"
-for config in "$CONFIG_DIR/opencode.json" "$CONFIG_DIR/opencode.jsonc" "${OPENCODE_CONFIG:-}"; do
+echo "== 3. opencode plugin (V2 API) =="
+# V2 auto-discovers direct files under $CONFIG_DIR/plugins, so install as a
+# single traffic-light.js. V1 installers used plugins/traffic-light/ with a
+# file entry in config, which V2 rejects ("must be a directory"): refresh that
+# legacy copy too when present, and drop stale file entries from the configs.
+mkdir -p "$CONFIG_DIR/plugins"
+cp traffic-light.js "$CONFIG_DIR/plugins/traffic-light.js"
+if [ -d "$CONFIG_DIR/plugins/traffic-light" ]; then
+  cp traffic-light.js "$CONFIG_DIR/plugins/traffic-light/traffic-light.js"
+  echo "  refreshed legacy $CONFIG_DIR/plugins/traffic-light/traffic-light.js"
+fi
+for config in "$CONFIG_DIR/opencode.json" "$CONFIG_DIR/opencode.jsonc" ${OPENCODE_CONFIG:-}; do
   if [ -f "$config" ] && grep -Fq 'plugins/traffic-light/traffic-light.js' "$config"; then
-    PLUGIN_DIR="$CONFIG_DIR/plugins/traffic-light"
-    break
+    python3 - "$config" <<'EOF'
+import re, sys
+p = sys.argv[1]
+raw = open(p).read()
+raw = re.sub(r'\s*"(\./)?plugins/traffic-light/traffic-light\.js"\s*,?', '', raw)
+raw = re.sub(r',\s*([\]}])', r'\1', raw)
+open(p, 'w').write(raw)
+EOF
+    echo "  removed stale file entry from $config (auto-discovery covers it)"
   fi
 done
-mkdir -p "$PLUGIN_DIR"
-cp traffic-light.js "$PLUGIN_DIR/traffic-light.js"
-if [ "$PLUGIN_DIR" = "$CONFIG_DIR/plugins/traffic-light" ]; then
-  cp package.json "$PLUGIN_DIR/package.json"
-fi
-echo "  installed in $PLUGIN_DIR (OpenCode configuration left unchanged)"
+echo "  installed $CONFIG_DIR/plugins/traffic-light.js"
 
 echo "== 4. OpenCode-linked service =="
 if [ "$OS" = Darwin ]; then

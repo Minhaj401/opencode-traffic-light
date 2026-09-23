@@ -40,24 +40,73 @@ function harness() {
 
   world.request = async (path = "/status", body) => {
     assert.ok(world.owner, "a simulated process owns the port");
-    const response = await world.owner.server.options.fetch(new Request(`http://127.0.0.1:4390${path}`,
-      body === undefined ? {} : {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: typeof body === "string" ? body : JSON.stringify(body),
-      }));
-    return response;
+    const handler = world.owner.server.handler;
+    return new Promise((resolve) => {
+      const listeners = {};
+      const req = {
+        url: path,
+        method: body === undefined ? "GET" : "POST",
+        on(name, fn) { (listeners[name] ||= []).push(fn); return this; },
+      };
+      const chunks = [];
+      const res = {
+        statusCode: 200,
+        headers: {},
+        setHeader(k, v) { this.headers[k] = v; },
+        end(data) {
+          const text = String(data || "");
+          resolve({
+            status: this.statusCode,
+            headers: { get: (k) => this.headers[k.toLowerCase()] },
+            json: async () => JSON.parse(text),
+          });
+        },
+      };
+      handler(req, res);
+      if (body !== undefined) {
+        const text = typeof body === "string" ? body : JSON.stringify(body);
+        for (const fn of listeners["data"] || []) fn(text);
+      }
+      for (const fn of listeners["end"] || []) fn();
+    });
   };
   world.state = async () => (await (await world.request()).json()).state;
+
+  world.emit = async (p, ev) => {
+    if (p.emitWaiters.length) p.emitWaiters.shift()({ value: ev, done: false });
+    else p.emitQueue.push(ev);
+    await flush();
+    await flush();
+  };
 
   world.load = async (options = {}) => {
     const p = {
       id: `process-${world.processes.length + 1}`,
-      execs: [], requests: [], writes: [], logs: [], output: [], timeouts: [], children: [],
+      execs: [], requests: [], writes: [], output: [], timeouts: [], children: [],
+      hooks: {}, emitQueue: [], emitWaiters: [],
       fetchMode: null, serveError: false,
     };
     world.processes.push(p);
     const mocks = {
+      "node:http": {
+        default: {
+          createServer(handler) {
+            const srv = { ...handle(), handler };
+            srv.on = () => srv;
+            srv.listen = (port, host, cb) => {
+              assert.equal(host, "127.0.0.1");
+              assert.equal(port, 4390);
+              world.actions.push(`serve:${p.id}`);
+              if (world.owner || p.serveError || options.serveError) throw new Error("EADDRINUSE");
+              p.server = srv;
+              world.owner = p;
+              if (typeof cb === "function") cb();
+              return srv;
+            };
+            return srv;
+          },
+        },
+      },
       "node:child_process": {
         execFile(file, args, execOptions, callback) {
           world.actions.push(`exec:${p.id}`);
@@ -91,7 +140,7 @@ function harness() {
       "node:path": { join },
     };
     const context = createContext({
-      URL, Request, Response,
+      URL, Request, Response, AbortController,
       process: { platform: options.platform || "darwin" },
       Date: class extends Date {
         constructor(...args) { super(...(args.length ? args : [world.now])); }
@@ -99,6 +148,7 @@ function harness() {
       },
       console: {
         log(...args) { p.output.push(args); },
+        info(...args) { p.output.push(args); },
         warn(...args) { p.output.push(args); },
         error(...args) { p.output.push(args); },
       },
@@ -109,17 +159,6 @@ function harness() {
           p.timeouts.push(ms);
           timer(p, () => controller.abort(new Error("request timeout")), ms).unref();
           return controller.signal;
-        },
-      },
-      Bun: {
-        serve(serverOptions) {
-          world.actions.push(`serve:${p.id}`);
-          assert.equal(serverOptions.hostname, "127.0.0.1");
-          assert.equal(serverOptions.port, 4390);
-          if (world.owner || p.serveError) throw new Error("EADDRINUSE");
-          p.server = { ...handle(), options: serverOptions };
-          world.owner = p;
-          return p.server;
         },
       },
       fetch(url, requestOptions) {
@@ -137,7 +176,10 @@ function harness() {
         if (p.fetchMode === "throw") throw new Error("network failure");
         if (p.fetchMode === "reject") return Promise.reject(new Error("network failure"));
         if (!world.owner) return Promise.reject(new Error("ECONNREFUSED"));
-        return world.owner.server.options.fetch(new Request(url, requestOptions));
+        return (async () => {
+          const response = await world.request("/heartbeat", call.body);
+          return { body: { cancel: async () => {} }, status: response.status };
+        })();
       },
     });
     const module = new SourceTextModule(source, { context });
@@ -148,16 +190,28 @@ function harness() {
       }, { context });
     });
     await module.evaluate();
-    const ctx = { client: { app: { log(entry) {
-      p.logs.push(entry);
-      if (options.logThrows) throw new Error("log failed");
-      if (options.logRejects) return Promise.reject(new Error("log failed"));
-      if (options.logHangs) return new Promise(() => {});
-    } } } };
-    p.init = () => module.namespace.TrafficLightPlugin(ctx);
-    assert.equal(module.namespace.default, module.namespace.TrafficLightPlugin);
-    p.hooks = await p.init();
-    p.event = (type, properties = {}) => p.hooks.event({ event: { type, properties } });
+    const def = module.namespace.default;
+    assert.equal(def.id, "traffic-light");
+    assert.equal(typeof def.setup, "function");
+    const ctx = {
+      tool: { hook: async (name, fn) => { p.hooks[`tool.${name}`] = fn; } },
+      permission: { hook: async (name, fn) => { p.hooks[`permission.${name}`] = fn; } },
+      event: {
+        subscribe: () => ({
+          [Symbol.asyncIterator]() { return this; },
+          next: () => new Promise((resolve) => {
+            if (p.emitQueue.length) resolve({ value: p.emitQueue.shift(), done: false });
+            else p.emitWaiters.push(resolve);
+          }),
+        }),
+      },
+    };
+    p.init = () => def.setup(ctx);
+    p.cleanup = await p.init();
+    p.before = (tool, extra = {}) => p.hooks["tool.execute.before"]({ tool, ...extra });
+    p.after = (tool, extra = {}) => p.hooks["tool.execute.after"]({ tool, ...extra });
+    p.permit = (effect, extra = {}) => p.hooks["permission.evaluate"]({ effect, ...extra });
+    p.event = (type, data = {}) => world.emit(p, { type, data });
     await flush();
     return p;
   };
@@ -180,21 +234,34 @@ test("startup binds loopback before one absolute-path autostart and unrefs handl
   for (const h of [child, child.stdin, child.stdout, child.stderr]) assert.equal(h.unrefs, 1);
   assert.equal(p.writes.length, 1);
   assert.equal(p.writes[0].path, "/tmp/traffic-light-plugin.loaded");
-  assert.deepEqual(JSON.parse(p.writes[0].content), { at: "1970-01-01T00:00:00.000Z", serving: true });
+  assert.deepEqual(JSON.parse(p.writes[0].content), { at: "1970-01-01T00:00:00.000Z", serving: true, v2: true });
   const response = await w.request();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type"), /application\/json/);
   assert.deepEqual(await response.json(), { state: "green" });
 });
 
+test("debug endpoint exposes local state for troubleshooting", async () => {
+  const w = harness();
+  const p = await w.load();
+  await p.before("subagent", { sessionID: "a", id: "call-1" });
+  const debug = await (await w.request("/debug")).json();
+  assert.equal(debug.serving, true);
+  assert.deepEqual(debug.local, { a: "yellow" });
+  assert.deepEqual(debug.tasks, ["a"]);
+  assert.deepEqual(debug.legacy, {});
+  assert.equal(debug.aggregate, "green".replace("green", "yellow"));
+});
+
 test("duplicate initialization and ordinary activity never reopen a manually closed widget", async () => {
   const w = harness();
   const p = await w.load();
   w.widgetRunning = false;
-  const [first, second] = await Promise.all([p.init(), p.init()]);
-  await first["tool.execute.before"]({ sessionID: "a", tool: "question" });
-  await second["tool.execute.after"]({ sessionID: "a", tool: "question" });
-  await p.event("session.idle", { sessionID: "a" });
+  await p.init();
+  await p.init();
+  await p.before("question", { sessionID: "a" });
+  await p.after("question", { sessionID: "a" });
+  await p.event("session.execution.succeeded", { sessionID: "a" });
   await p.event("session.deleted", { sessionID: "a" });
   await w.advance(6000);
   assert.equal(p.execs.length, 1);
@@ -206,27 +273,26 @@ test("duplicate initialization and ordinary activity never reopen a manually clo
   assert.equal(w.widgetRunning, true);
 });
 
-test("missing CLI, spawn errors, logging and marker failures are quiet", async () => {
+test("missing CLI, spawn errors and marker failures are quiet", async () => {
   for (const options of [
-    { cliError: true }, { cliThrows: true }, { writeError: true },
-    { logThrows: true }, { logRejects: true }, { disabled: true },
+    { cliError: true }, { cliThrows: true }, { writeError: true }, { disabled: true },
   ]) {
     const w = harness();
     const p = await w.load(options);
-    await p.event("permission.asked", { sessionID: "a" });
+    await p.permit("ask", { sessionID: "a" });
     await w.advance(1000);
     assert.equal(await w.state(), "red");
     assert.equal(p.execs.length, 1);
-    assert.deepEqual(p.output, []);
+    assert.deepEqual(p.output, [["[traffic-light] serving state at http://127.0.0.1:4390/status"]]);
     if (options.disabled) assert.equal(w.widgetRunning, false);
   }
 });
 
-test("hung startup and logging do not block initialization or hooks; CLI timeout is 3000ms", { timeout: 2000 }, async () => {
+test("hung startup does not block initialization or hooks; CLI timeout is 3000ms", { timeout: 2000 }, async () => {
   const w = harness();
-  const p = await w.load({ cliHangs: true, logHangs: true });
+  const p = await w.load({ cliHangs: true });
   assert.equal(p.execs[0].completed, false);
-  await p.hooks["tool.execute.before"]({ tool: "bash" });
+  await p.before("bash");
   assert.equal(await w.state(), "yellow");
   await w.advance(2999);
   assert.equal(p.execs[0].completed, false);
@@ -234,7 +300,7 @@ test("hung startup and logging do not block initialization or hooks; CLI timeout
   assert.equal(p.execs[0].error.killed, true);
   await p.init();
   assert.equal(p.execs.length, 1);
-  assert.deepEqual(p.output, []);
+  assert.deepEqual(p.output, [["[traffic-light] serving state at http://127.0.0.1:4390/status"]]);
 });
 
 test("Linux requests autostart; unsupported platforms skip CLI without losing status", async () => {
@@ -249,173 +315,115 @@ test("Linux requests autostart; unsupported platforms skip CLI without losing st
 test("hooks retain red > yellow > green priority and session transitions", async () => {
   const w = harness();
   const p = await w.load();
-  await p.event("session.created", { sessionID: "a" });
-  await p.hooks["tool.execute.before"]({ sessionID: "a", tool: "bash" });
+  await p.event("session.step.started", { sessionID: "a" });
   assert.equal(await w.state(), "yellow");
-  await p.hooks["tool.execute.after"]({ sessionID: "a", tool: "bash" });
+  await p.before("bash", { sessionID: "a" });
   assert.equal(await w.state(), "yellow");
-  await p.event("permission.asked", { sessionID: "b" });
-  await p.event("session.idle", { sessionID: "a" });
+  await p.permit("ask", { sessionID: "b" });
+  await p.event("session.step.ended", { sessionID: "a" });
   assert.equal(await w.state(), "red");
-  await p.event("permission.replied", { sessionID: "b" });
+  await p.permit("allow", { sessionID: "b" });
+  await p.before("bash", { sessionID: "b" });
   assert.equal(await w.state(), "yellow");
-  await p.event("session.error", { sessionID: "b" });
+  await p.event("session.execution.succeeded", { sessionID: "b" });
+  assert.equal(await w.state(), "yellow");
+  await p.event("session.execution.succeeded", { sessionID: "a" });
   assert.equal(await w.state(), "green");
   for (const tool of ["question", "ask", "input", "prompt", "CONFIRM"]) {
-    await p.hooks["tool.execute.before"]({ sessionId: "a", tool });
+    await p.before(tool, { sessionID: "a" });
     assert.equal(await w.state(), "red");
-    await p.hooks["tool.execute.after"]({ sessionId: "a", tool });
+    await p.after(tool, { sessionID: "a" });
     assert.equal(await w.state(), "yellow");
   }
-  for (const [status, state] of [
-    ["approval", "red"], ["processing", "yellow"], ["completed", "green"],
-    [{ type: "busy" }, "yellow"], [{ type: "idle" }, "green"], [{ type: "retry" }, "yellow"],
-  ]) {
-    await p.event("session.status", { sessionID: "a", status });
-    assert.equal(await w.state(), state);
-  }
-  await p.event("session.status", { sessionID: "a", status: "unknown" });
-  assert.equal(await w.state(), "yellow");
-  await p.event("session.deleted", { info: { id: "a" } });
-  await p.event("message.updated", { info: { sessionID: "message-session", id: "message-id", role: "assistant" } });
-  assert.equal(await w.state(), "yellow");
-  await p.event("session.deleted", { info: { id: "message-session" } });
-  await p.event("message.updated", { sessionID: "a", role: "user" });
-  await p.event("unknown");
-  await p.hooks.event({});
+  await p.event("session.execution.interrupted", { sessionID: "a" });
   assert.equal(await w.state(), "green");
-  await p.hooks["tool.execute.before"]();
+  await p.before(undefined);
   assert.equal(await w.state(), "yellow");
   await p.event("session.deleted");
   assert.equal(await w.state(), "green");
 });
 
-test("running subagent tasks stay yellow after parent idle until every call finishes", async () => {
+test("running subagent tasks stay yellow after parent step ends until every call finishes", async () => {
   const w = harness();
   const p = await w.load();
-  const first = { sessionID: "parent", tool: "task", callID: "first" };
-  const second = { sessionID: "parent", tool: "task", callID: "second" };
+  const first = { sessionID: "parent", tool: "subagent", id: "first" };
+  const second = { sessionID: "parent", tool: "subagent", id: "second" };
   await p.hooks["tool.execute.before"](first);
-  assert.equal(await w.state(), "yellow"); // "task" must not match the "ask" input tool.
+  assert.equal(await w.state(), "yellow"); // "subagent" keeps working state
   await p.hooks["tool.execute.before"](first); // Duplicate delivery is not another task.
   await p.hooks["tool.execute.before"](second);
-  await p.event("session.status", { sessionID: "parent", status: { type: "idle" } });
-  await p.event("session.idle", { sessionID: "parent" });
+  await p.event("session.step.ended", { sessionID: "parent" });
   assert.equal(await w.state(), "yellow");
   await p.hooks["tool.execute.after"](second);
   assert.equal(await w.state(), "yellow");
   await p.hooks["tool.execute.after"](first);
+  await p.event("session.step.ended", { sessionID: "parent" });
+  assert.equal(await w.state(), "yellow");
+  await p.event("session.execution.succeeded", { sessionID: "parent" });
   assert.equal(await w.state(), "green");
   await p.hooks["tool.execute.after"](first);
   assert.equal(await w.state(), "green");
 });
 
-test("task parts reconcile subtask hook IDs and clear failures without an after hook", async () => {
+test("legacy task tool name is tracked the same as subagent", async () => {
   const w = harness();
   const p = await w.load();
-  const part = { id: "part-id", callID: "call-id", sessionID: "parent", type: "tool", tool: "task" };
-  await p.event("message.part.updated", { part: { ...part, state: { status: "pending", input: {} } } });
-  await p.hooks["tool.execute.before"]({ sessionID: "parent", tool: "task", callID: part.id });
-  await p.event("message.part.updated", { part: { ...part, state: { status: "running", input: {} } } });
-  await p.event("session.idle", { sessionID: "parent" });
+  await p.hooks["tool.execute.before"]({ sessionID: "parent", tool: "task", id: "call-id" });
+  await p.event("session.step.ended", { sessionID: "parent" });
   assert.equal(await w.state(), "yellow");
-  await p.hooks["tool.execute.after"]({ sessionID: "parent", tool: "task", callID: part.id });
-  assert.equal(await w.state(), "green");
-  await p.event("message.part.updated", { part: { ...part, state: { status: "running", input: {} } } });
+  await p.hooks["tool.execute.after"]({ sessionID: "parent", tool: "task", id: "call-id" });
+  await p.event("session.step.ended", { sessionID: "parent" });
   assert.equal(await w.state(), "yellow");
-  await p.event("message.part.updated", { part: { ...part, state: { status: "error", error: "cancelled" } } });
+  await p.event("session.execution.succeeded", { sessionID: "parent" });
   assert.equal(await w.state(), "green");
 });
 
-test("input-tool tokens exclude task and unrelated substrings but retain namespaced prompts", async () => {
+test("session tool events reconcile call IDs and clear failures", async () => {
   const w = harness();
   const p = await w.load();
-  for (const tool of ["task", "mask", "askpass", "confirmation", "inputstream"]) {
-    await p.hooks["tool.execute.before"]({ sessionID: "parent", tool, callID: tool });
+  await p.event("session.tool.called", { sessionID: "parent", id: "call-id" });
+  await p.event("session.step.ended", { sessionID: "parent" });
+  assert.equal(await w.state(), "yellow");
+  await p.event("session.tool.success", { sessionID: "parent", id: "call-id" });
+  await p.event("session.step.ended", { sessionID: "parent" });
+  assert.equal(await w.state(), "yellow");
+  await p.event("session.execution.succeeded", { sessionID: "parent" });
+  assert.equal(await w.state(), "green");
+  await p.event("session.tool.called", { sessionID: "parent", id: "call-id" });
+  assert.equal(await w.state(), "yellow");
+  await p.event("session.tool.failed", { sessionID: "parent", id: "call-id" });
+  await p.event("session.step.ended", { sessionID: "parent" });
+  assert.equal(await w.state(), "yellow");
+  await p.event("session.execution.succeeded", { sessionID: "parent" });
+  assert.equal(await w.state(), "green");
+});
+
+test("input-tool tokens exclude subagent and unrelated substrings but retain namespaced prompts", async () => {
+  const w = harness();
+  const p = await w.load();
+  for (const tool of ["subagent", "task", "mask", "askpass", "confirmation", "inputstream"]) {
+    await p.before(tool, { sessionID: "parent", id: tool });
     assert.equal(await w.state(), "yellow", tool);
-    await p.event("session.idle", { sessionID: "parent" });
-    await p.hooks["tool.execute.after"]({ sessionID: "parent", tool, callID: tool });
+    await p.event("session.execution.succeeded", { sessionID: "parent" });
+    await p.after(tool, { sessionID: "parent", id: tool });
     assert.equal(await w.state(), "green", tool);
   }
   for (const tool of ["question", "ask_user", "functions.question", "mcp__ui__confirm", "ui/prompt"]) {
-    await p.hooks["tool.execute.before"]({ sessionID: "parent", tool });
+    await p.before(tool, { sessionID: "parent" });
     assert.equal(await w.state(), "red", tool);
-    await p.hooks["tool.execute.after"]({ sessionID: "parent", tool });
+    await p.after(tool, { sessionID: "parent" });
     assert.equal(await w.state(), "yellow", tool);
   }
 });
 
-test("task completion does not mark an otherwise-working parent idle", async () => {
+test("ended steps do not clear red waiting sessions", async () => {
   const w = harness();
   const p = await w.load();
-  const input = { sessionID: "parent", tool: "task", callID: "call" };
-  await p.hooks["tool.execute.before"](input);
-  await p.hooks["tool.execute.after"](input);
-  assert.equal(await w.state(), "yellow");
-  await p.event("session.idle", { sessionID: "parent" });
-  assert.equal(await w.state(), "green");
-});
-
-test("pending and running task parts alone hold yellow and completion removes only that task", async () => {
-  const w = harness();
-  const p = await w.load();
-  const part = (id, status, tool = "task") => ({
-    id, callID: `call-${id}`, sessionID: "parent", type: "tool", tool, state: { status, input: {} },
-  });
-  await p.event("message.part.updated", { part: part("a", "pending") });
-  await p.event("message.part.updated", { part: part("b", "running") });
-  await p.event("session.created", { info: { id: "parent" } });
-  assert.equal(await w.state(), "yellow");
-  await p.event("message.part.updated", { part: part("a", "running") });
-  await p.event("message.part.updated", { part: part("a", "completed") });
-  assert.equal(await w.state(), "yellow");
-  await p.event("message.part.updated", { part: part("b", "completed") });
-  await p.event("message.part.updated", { part: part("unrelated", "running", "read") });
-  await p.event("message.part.updated", { part: part("invalid", "unknown") });
-  assert.equal(await w.state(), "green");
-});
-
-test("removed task parts and errored/deleted sessions cannot leave stale task activity", async () => {
-  for (const cleanup of ["message.part.removed", "session.error", "session.deleted"]) {
-    const w = harness();
-    const p = await w.load();
-    const part = { id: "part", callID: "call", sessionID: "parent", type: "tool", tool: "task",
-      state: { status: "running", input: {} } };
-    await p.event("message.part.updated", { part });
-    await p.event("session.idle", { sessionID: "parent" });
-    const other = { sessionID: "other", tool: "task", callID: "other-call" };
-    await p.hooks["tool.execute.before"](other);
-    await p.event("session.idle", { sessionID: "other" });
-    await p.event(cleanup, { sessionID: "parent", partID: part.id });
-    assert.equal(await w.state(), "yellow", "other session still has an active task");
-    await p.hooks["tool.execute.after"](other);
-    assert.equal(await w.state(), "green", cleanup);
-    await p.event("message.part.updated", { part: { ...part, state: { status: "error", error: "aborted" } } });
-    assert.equal(await w.state(), "green", "late cancellation cleanup remains idempotent");
-  }
-});
-
-test("background and nested child work outlives parent task return and keeps input priority", async () => {
-  const w = harness();
-  const p = await w.load();
-  const input = { sessionID: "parent", tool: "task", callID: "background-call" };
-  await p.hooks["tool.execute.before"](input);
-  await p.event("session.created", { info: { id: "child", parentID: "parent" } });
-  await p.event("session.status", { sessionID: "child", status: { type: "busy" } });
-  await p.hooks["tool.execute.after"](input, { metadata: { sessionId: "child", background: true } });
-  await p.event("session.idle", { sessionID: "parent" });
-  assert.equal(await w.state(), "yellow");
-  await p.event("session.status", { sessionID: "grandchild", status: { type: "retry" } });
-  await p.event("session.idle", { sessionID: "child" });
-  assert.equal(await w.state(), "yellow");
-  await p.event("permission.asked", { sessionID: "grandchild" });
-  await p.event("message.part.updated", { part: { id: "nested-part", callID: "nested-call",
-    sessionID: "grandchild", type: "tool", tool: "task", state: { status: "running" } } });
-  assert.equal(await w.state(), "red", "running task overlay must not replace a waiting session's red");
-  await p.event("permission.replied", { sessionID: "grandchild" });
-  await p.event("message.part.removed", { sessionID: "grandchild", partID: "nested-part" });
-  assert.equal(await w.state(), "yellow");
-  await p.event("session.idle", { sessionID: "grandchild" });
+  await p.permit("ask", { sessionID: "waiting" });
+  await p.event("session.step.ended", { sessionID: "waiting" });
+  assert.equal(await w.state(), "red");
+  await p.before("bash", { sessionID: "waiting" });
+  await p.event("session.execution.succeeded", { sessionID: "waiting" });
   assert.equal(await w.state(), "green");
 });
 
@@ -423,19 +431,22 @@ test("task busy state is forwarded in snapshots and survives status-server takeo
   const w = harness();
   const owner = await w.load();
   const peer = await w.load();
-  const input = { sessionID: "parent", tool: "task", callID: "task-call" };
+  const input = { sessionID: "parent", tool: "subagent", id: "task-call" };
   await peer.hooks["tool.execute.before"](input);
-  await peer.event("session.idle", { sessionID: "parent" });
+  await peer.event("session.step.ended", { sessionID: "parent" });
   await w.advance(1000);
   assert.deepEqual(peer.requests.at(-1).body.sessions, { parent: "yellow" });
   assert.equal(await w.state(), "yellow");
-  await owner.event("permission.asked", { sessionID: "waiting" });
+  await owner.permit("ask", { sessionID: "waiting" });
   assert.equal(await w.state(), "red");
   w.stop(owner);
   await w.advance(1000);
   assert.equal(w.owner, peer);
   assert.equal(await w.state(), "yellow");
   await peer.hooks["tool.execute.after"](input);
+  await peer.event("session.step.ended", { sessionID: "parent" });
+  assert.equal(await w.state(), "yellow");
+  await peer.event("session.execution.succeeded", { sessionID: "parent" });
   assert.equal(await w.state(), "green");
   assert.equal(peer.execs.length, 1, "task activity must not relaunch a dismissed widget");
 });
@@ -447,16 +458,16 @@ test("multiple processes send full periodic snapshots without sharing session ow
   const other = await w.load();
   assert.notEqual(peer.requests[0].body.processId, other.requests[0].body.processId);
   assert.deepEqual(peer.requests[0].body.sessions, {});
-  await owner.event("permission.asked", { sessionID: "same" });
-  await peer.event("session.idle", { sessionID: "same" });
+  await owner.permit("ask", { sessionID: "same" });
+  await peer.event("session.step.started", { sessionID: "same" });
   await other.hooks["tool.execute.before"]({ sessionID: "work", tool: "bash" });
   await flush();
   assert.equal(await w.state(), "red");
   await owner.event("session.deleted", { sessionID: "same" });
   assert.equal(await w.state(), "yellow");
-  await peer.event("permission.asked", { sessionID: "same" });
+  await peer.permit("ask", { sessionID: "same" });
   await flush();
-  await other.event("session.idle", { sessionID: "same" });
+  await other.event("session.execution.succeeded", { sessionID: "same" });
   await flush();
   assert.equal(await w.state(), "red");
   await peer.event("session.deleted", { sessionID: "same" });
@@ -497,9 +508,9 @@ test("idle survivors take over the port after owner exit and publish only their 
   const owner = await w.load();
   const survivor = await w.load();
   const peer = await w.load();
-  await owner.event("permission.asked", { sessionID: "departing" });
+  await owner.permit("ask", { sessionID: "departing" });
   await survivor.hooks["tool.execute.before"]({ sessionID: "same", tool: "bash" });
-  await peer.event("permission.asked", { sessionID: "same" });
+  await peer.permit("ask", { sessionID: "same" });
   await flush();
   w.widgetRunning = false;
   w.stop(owner);
@@ -523,10 +534,10 @@ test("hung forwarding is single-flight, bounded to 800ms, and never blocks hooks
   await w.load();
   const peer = await w.load();
   peer.fetchMode = "hang";
-  await peer.event("permission.asked", { sessionID: "a" });
+  await peer.permit("ask", { sessionID: "a" });
   const count = peer.requests.length;
   const request = peer.requests.at(-1);
-  for (let i = 0; i < 10; i++) await peer.event("session.idle", { sessionID: "a" });
+  for (let i = 0; i < 10; i++) await peer.event("session.tool.progress", { sessionID: "a" });
   assert.equal(peer.requests.length, count);
   await w.advance(799);
   assert.equal(request.signal.aborted, false);
@@ -534,7 +545,8 @@ test("hung forwarding is single-flight, bounded to 800ms, and never blocks hooks
   await w.advance(1);
   assert.equal(request.signal.aborted, true);
   peer.fetchMode = null;
-  await w.advance(200);
+  await peer.event("session.execution.succeeded", { sessionID: "a" });
+  await w.advance(150);
   assert.equal(peer.requests.length, count + 1);
   assert.deepEqual(peer.requests.at(-1).body.sessions, { a: "green" });
   assert.equal(await w.state(), "green");
@@ -546,16 +558,22 @@ test("changes and deletions during a successful in-flight snapshot arrive on the
   await w.load();
   const peer = await w.load();
   peer.fetchMode = "hang";
-  await peer.event("permission.asked", { sessionID: "a" });
+  await peer.permit("ask", { sessionID: "a" });
   const request = peer.requests.at(-1);
   await peer.event("session.deleted", { sessionID: "a" });
-  await peer.event("session.created", { info: { id: "b" } });
+  await peer.event("session.step.started", { sessionID: "b" });
   request.resolve(await w.request("/heartbeat", request.body));
   await flush();
   assert.equal(await w.state(), "red");
   peer.fetchMode = null;
   await w.advance(1000);
-  assert.deepEqual(peer.requests.at(-1).body.sessions, { b: "green" });
+  assert.deepEqual(peer.requests.at(-1).body.sessions, { b: "yellow" });
+  assert.equal(await w.state(), "yellow");
+  await peer.event("session.step.ended", { sessionID: "b" });
+  await w.advance(1100);
+  assert.equal(await w.state(), "yellow");
+  await peer.event("session.execution.succeeded", { sessionID: "b" });
+  await w.advance(1100);
   assert.equal(await w.state(), "green");
 });
 
@@ -565,7 +583,7 @@ test("an idle peer takes over after its in-flight request to the departed owner 
   const peer = await w.load();
   await w.advance(600);
   peer.fetchMode = "hang";
-  await peer.event("permission.asked", { sessionID: "a" });
+  await peer.permit("ask", { sessionID: "a" });
   const request = peer.requests.at(-1);
   w.stop(owner);
   await w.advance(400);
@@ -578,7 +596,7 @@ test("an idle peer takes over after its in-flight request to the departed owner 
   assert.equal(w.owner, peer);
   assert.equal(await w.state(), "red");
   assert.equal(peer.execs.length, 1);
-  assert.deepEqual(peer.output, []);
+  assert.deepEqual(peer.output, [["[traffic-light] serving state at http://127.0.0.1:4390/status"]]);
 });
 
 test("background network and bind errors stay quiet and retry without relaunch", async () => {
@@ -587,7 +605,7 @@ test("background network and bind errors stay quiet and retry without relaunch",
   const peer = await w.load();
   for (const mode of ["throw", "reject"]) {
     peer.fetchMode = mode;
-    await peer.event("permission.asked", { sessionID: "a" });
+    await peer.permit("ask", { sessionID: "a" });
     await w.advance(1000);
   }
   peer.fetchMode = null;
@@ -602,7 +620,7 @@ test("background network and bind errors stay quiet and retry without relaunch",
   assert.equal(w.owner, peer);
   assert.equal(await w.state(), "red");
   assert.equal(peer.execs.length, 1);
-  assert.deepEqual(peer.output, []);
+  assert.deepEqual(peer.output, [["[traffic-light] serving state at http://127.0.0.1:4390/status"]]);
 });
 
 test("malformed snapshots are rejected atomically and cannot refresh or replace peer state", async () => {

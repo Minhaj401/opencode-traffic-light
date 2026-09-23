@@ -2,6 +2,8 @@
 
 A compact desktop indicator for session activity on macOS and Linux.
 
+![Demo](demo.gif)
+
 - 🟢 **Green** — finished or idle
 - 🟡 **Yellow** — work is running, including parallel and background tasks
 - 🔴 **Red** — waiting for permission or an answer
@@ -30,7 +32,7 @@ A compact desktop indicator for session activity on macOS and Linux.
 |---|---|
 | macOS | macOS 12 or later, a desktop login, and recent Apple Command Line Tools to compile the widget. Swift 6 is recommended. |
 | Linux | Python 3.8 or later, GTK3, PyGObject, PyCairo, the GI/Cairo bridge, and systemd user services. |
-| Both | The `opencode` CLI with local-plugin and event-hook support; the existing project baseline is version 1.15 or later. |
+| Both | The `opencode` CLI with local-plugin and event-hook support; the existing project baseline is version 2.0 or later (V2 plugin API). |
 
 The compiled macOS widget needs no Homebrew, Python, or GTK installation.
 
@@ -140,8 +142,9 @@ started widget with no backend exits after approximately five seconds.
 
 Fresh installations use the automatically discovered plugin file at
 `~/.config/opencode/plugins/traffic-light.js`. If configuration already references
-`plugins/traffic-light/traffic-light.js`, setup updates that nested installation
-instead of adding another copy.
+`plugins/traffic-light/traffic-light.js` (V1 layout), setup updates that nested
+installation, refreshes its copy, and removes the stale file entry; V2 rejects
+file paths in `plugins` entries, while the auto-discovered file needs no entry.
 
 The plugin destination uses `OPENCODE_CONFIG_DIR` when set, otherwise
 `${XDG_CONFIG_HOME:-$HOME/.config}/opencode`. `OPENCODE_CONFIG` is checked for an
@@ -167,6 +170,13 @@ macOS, use `enable` after `disable`; Linux also permits manual `start` while dis
 ```text
 backend events → traffic-light.js → localhost HTTP → native or GTK widget
 ```
+
+The plugin is a V2 `{ id, setup }` definition. It tracks work through
+`tool.execute.before/after` hooks, permission prompts through the `evaluate`
+hook (`effect === "ask"` means waiting on the user), and session lifecycle
+through the event stream (`session.step.started/ended`,
+`session.tool.called/success/failed`, `session.execution.succeeded/interrupted`).
+The V1 `task` tool is tracked under both its old name and the V2 `subagent` name.
 
 The plugin serves `GET /status` at `127.0.0.1:4390`, returning
 `{"state":"green"}`, `{"state":"yellow"}`, or `{"state":"red"}`.

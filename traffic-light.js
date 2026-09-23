@@ -1,4 +1,4 @@
-// traffic-light — opencode plugin.
+// traffic-light — opencode plugin (V2 API).
 //
 // Aggregates session states and serves them at
 // http://127.0.0.1:4390/status as {"state": "green"|"yellow"|"red"}
@@ -9,6 +9,20 @@
 //
 // Port sharing: the first opencode process owns the server; later ones
 // publish process snapshots via POST /heartbeat and retry ownership each second.
+//
+// V2 notes (opencode 2.x):
+// - Default export is a plain { id, setup } definition; no @opencode/plugin
+//   import needed. V1 function-returning-hooks plugins do not load in V2.
+// - Tool lifecycle arrives via ctx.tool.hook("execute.before"/"execute.after")
+//   with { tool, sessionID, id, input, status }.
+// - Permission prompts arrive via ctx.permission.hook("evaluate") with
+//   { sessionID, action, effect }; effect === "ask" means waiting on the user.
+// - Session lifecycle arrives via ctx.event.subscribe() with
+//   { type, data }: session.step.started/ended, session.tool.called/success/
+//   failed, session.execution.succeeded/interrupted. V1 names such as
+//   session.idle, session.created, permission.asked and message.part.updated
+//   are not emitted in V2.
+import http from "node:http";
 import { execFile } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { writeFileSync } from "node:fs";
@@ -18,6 +32,8 @@ import { join } from "node:path";
 const PORT = 4390;
 const COLORS = new Set(["green", "yellow", "red"]);
 // Match whole tool-name tokens: "task" contains "ask" but is not an input prompt.
+// V2 renamed the task tool to "subagent"; track both names.
+const TASK_TOOLS = new Set(["task", "subagent"]);
 const INPUT_TOOL = /(?:^|[._:/-])(?:question|ask|input|prompt|confirm)(?:$|[._:/-])/i;
 const processId = randomUUID();
 const localStates = new Map();
@@ -29,6 +45,7 @@ const legacyStates = new Map();
 let initialized = false;
 let serving = false;
 let inFlight = false;
+let server = null;
 
 function expirePeers() {
   const now = Date.now();
@@ -54,8 +71,8 @@ function trackTask(sid, ids, running) {
     calls = new Map();
     activeTasks.set(sid, calls);
   }
-  // Subtask hooks can use the part ID instead of callID. Merge both identities
-  // so duplicate hooks/part updates cannot count one task twice or strand it.
+  // Subagent hooks can report either the call ID or a part ID. Merge both
+  // identities so duplicate deliveries cannot count one task twice or strand it.
   const aliases = new Set(ids);
   for (const [key, known] of calls) {
     if (ids.some((id) => known.has(id))) {
@@ -81,43 +98,74 @@ function aggregate() {
   return s;
 }
 
+function handleBody(pathname, b) {
+  if (pathname === "/event") {
+    if (!b || typeof b.sid !== "string" || !b.sid || !COLORS.has(b.state)) {
+      return { status: 400 };
+    }
+    legacyStates.set(b.sid, b.state);
+  } else {
+    if (!b || typeof b.processId !== "string" || !b.processId ||
+        !b.sessions || typeof b.sessions !== "object" || Array.isArray(b.sessions)) {
+      return { status: 400 };
+    }
+    const entries = Object.entries(b.sessions);
+    if (entries.some(([sid, color]) => !sid || !COLORS.has(color))) {
+      return { status: 400 };
+    }
+    if (b.processId !== processId) {
+      peers.set(b.processId, { at: Date.now(), states: new Map(entries) });
+    }
+  }
+  return { status: 200, json: { ok: true } };
+}
+
 function ensureServer() {
   if (serving) return true;
   try {
-    Bun.serve({
-      port: PORT,
-      hostname: "127.0.0.1",
-      async fetch(req) {
-        const url = new URL(req.url);
-        if (req.method === "POST" && ["/event", "/heartbeat"].includes(url.pathname)) {
+    server = http.createServer((req, res) => {
+      const pathname = new URL(req.url || "/", "http://127.0.0.1").pathname;
+      if (pathname === "/debug" && req.method === "GET") {
+        expirePeers();
+        const dump = (m) => Object.fromEntries(m);
+        const peersDump = Object.fromEntries(
+          [...peers.entries()].map(([id, p]) => [id, { ageMs: Date.now() - p.at, states: dump(p.states) }])
+        );
+        res.statusCode = 200;
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({
+          pid: process.pid, serving, processId,
+          local: dump(localStates),
+          tasks: [...activeTasks.keys()],
+          legacy: dump(legacyStates),
+          peers: peersDump,
+          aggregate: aggregate(),
+        }));
+        return;
+      }
+      if (req.method === "POST" && (pathname === "/event" || pathname === "/heartbeat")) {        let raw = "";
+        req.on("data", (chunk) => { raw += chunk; });
+        req.on("end", () => {
+          let parsed;
           try {
-            const b = await req.json();
-            if (url.pathname === "/event") {
-              if (!b || typeof b.sid !== "string" || !b.sid || !COLORS.has(b.state)) {
-                return new Response("bad", { status: 400 });
-              }
-              legacyStates.set(b.sid, b.state);
-            } else {
-              if (!b || typeof b.processId !== "string" || !b.processId ||
-                  !b.sessions || typeof b.sessions !== "object" || Array.isArray(b.sessions)) {
-                return new Response("bad", { status: 400 });
-              }
-              const entries = Object.entries(b.sessions);
-              if (entries.some(([sid, color]) => !sid || !COLORS.has(color))) {
-                return new Response("bad", { status: 400 });
-              }
-              if (b.processId !== processId) {
-                peers.set(b.processId, { at: Date.now(), states: new Map(entries) });
-              }
-            }
-            return Response.json({ ok: true });
+            parsed = JSON.parse(raw);
           } catch {
-            return new Response("bad", { status: 400 });
+            parsed = undefined;
           }
-        }
-        return Response.json({ state: aggregate() });
-      },
-    }).unref();
+          const out = handleBody(pathname, parsed);
+          res.statusCode = out.status;
+          res.setHeader("content-type", "application/json");
+          res.end(JSON.stringify(out.json || { error: "bad" }));
+        });
+        return;
+      }
+      res.statusCode = 200;
+      res.setHeader("content-type", "application/json");
+      res.end(JSON.stringify({ state: aggregate() }));
+    });
+    server.on("error", () => {});
+    server.listen(PORT, "127.0.0.1");
+    if (typeof server.unref === "function") server.unref();
     serving = true;
     return true;
   } catch {
@@ -150,26 +198,62 @@ function set(sid, color) {
   void heartbeat();
 }
 
-function sidOf(event) {
-  const p = event.properties || {};
-  return p.sessionID || p.sessionId || p.session?.id || p.info?.sessionID || p.part?.sessionID ||
-    (event.type.startsWith("session.") && p.info?.id) || "global";
+// Step/tool completion must not downgrade a working or waiting session.
+// Green is set only when the full execution finishes; otherwise a busy agent
+// loop flickers yellow/green on every step boundary.
+function holdWork(sid) {
+  sid = sid || "global";
+  if (localStates.get(sid) === "red") return;
+  if (activeTasks.has(sid) || localStates.get(sid) === "yellow") {
+    set(sid, "yellow");
+    return;
+  }
 }
 
-function statusColor(s) {
-  if (s && typeof s === "object") s = s.type;
-  s = String(s || "").toLowerCase();
-  if (/wait|permission|ask|approval|blocked/.test(s)) return "red";
-  if (/busy|work|run|active|processing|retry/.test(s)) return "yellow";
-  if (/idle|done|complete|finish|compact/.test(s)) return "green";
-  return null;
+function onEvent(ev) {
+  if (!ev || typeof ev.type !== "string") return;
+  const data = ev.data || {};
+  const sid = data.sessionID || data.sessionId || "global";
+  switch (ev.type) {
+    case "session.step.started":
+      set(sid, "yellow");
+      break;
+    case "session.step.ended":
+      holdWork(sid);
+      break;
+    case "session.tool.called":
+      trackTask(sid, [data.id], true);
+      set(sid, "yellow");
+      break;
+    case "session.tool.success":
+    case "session.tool.failed":
+      trackTask(sid, [data.id], false);
+      void heartbeat();
+      break;
+    case "session.execution.succeeded":
+    case "session.execution.interrupted":
+    case "session.error":
+      activeTasks.delete(sid);
+      set(sid, "green");
+      break;
+    case "session.deleted":
+      activeTasks.delete(sid);
+      localStates.delete(sid);
+      void heartbeat();
+      break;
+    default:
+      break;
+  }
 }
 
-export const TrafficLightPlugin = async (ctx) => {
+async function setup(ctx) {
   if (!initialized) {
     initialized = true;
     void heartbeat();
-    setInterval(heartbeat, 1000).unref();
+    try {
+      const timer = setInterval(heartbeat, 1000);
+      if (timer && typeof timer.unref === "function") timer.unref();
+    } catch {}
     if (process.platform === "darwin" || process.platform === "linux") {
       try {
         const child = execFile(
@@ -178,99 +262,61 @@ export const TrafficLightPlugin = async (ctx) => {
           { timeout: 3000 },
           () => {}
         );
-        child.unref();
+        if (child && typeof child.unref === "function") child.unref();
         for (const stream of [child.stdin, child.stdout, child.stderr]) {
-          stream?.unref?.();
+          try { stream?.unref?.(); } catch {}
         }
       } catch {}
     }
     try {
       writeFileSync(
         "/tmp/traffic-light-plugin.loaded",
-        JSON.stringify({ at: new Date().toISOString(), serving }) + "\n"
+        JSON.stringify({ at: new Date().toISOString(), serving, v2: true }) + "\n"
       );
     } catch {}
     try {
-      if (ctx?.client) void Promise.resolve(ctx.client.app.log({
-        body: {
-          service: "traffic-light",
-          level: "info",
-          message: serving
-            ? "serving state at http://127.0.0.1:4390/status"
-            : "port taken, forwarding snapshots to state server",
-        },
-      })).catch(() => {});
+      console.info("[traffic-light] serving state at http://127.0.0.1:4390/status");
     } catch {}
   }
-  return {
-    event: async ({ event }) => {
-      if (!event || !event.type) return;
-      const sid = sidOf(event);
-      switch (event.type) {
-        case "permission.asked":
-          set(sid, "red");
-          break;
-        case "permission.replied":
-          set(sid, "yellow");
-          break;
-        case "session.idle":
-        case "session.created":
-          set(sid, "green");
-          break;
-        case "session.error":
-          activeTasks.delete(sid);
-          set(sid, "green");
-          break;
-        case "session.deleted":
-          activeTasks.delete(sid);
-          localStates.delete(sid);
-          void heartbeat();
-          break;
-        case "session.status": {
-          const c = statusColor(event.properties && event.properties.status);
-          if (c) set(sid, c);
-          break;
-        }
-        case "message.updated": {
-          const p = event.properties || {};
-          const role = p.role || (p.info && p.info.role);
-          if (role === "assistant") set(sid, "yellow");
-          break;
-        }
-        case "message.part.updated": {
-          const part = event.properties?.part;
-          if (part?.type !== "tool" || part.tool !== "task") break;
-          const status = part.state?.status;
-          if (!["pending", "running", "completed", "error"].includes(status)) break;
-          trackTask(sid, [part.callID, part.id], status === "pending" || status === "running");
-          void heartbeat();
-          break;
-        }
-        case "message.part.removed":
-          trackTask(sid, [event.properties?.partID], false);
-          void heartbeat();
-          break;
-      }
-    },
-    "tool.execute.before": async (input) => {
-      const sid =
-        (input && (input.sessionID || input.sessionId)) || "global";
-      const tool = (input && input.tool) || "";
-      if (tool === "task") trackTask(sid, [input?.callID], true);
-      set(sid, INPUT_TOOL.test(tool) ? "red" : "yellow");
-    },
-    "tool.execute.after": async (input) => {
-      const sid =
-        (input && (input.sessionID || input.sessionId)) || "global";
-      const tool = (input && input.tool) || "";
-      if (tool === "task") {
-        trackTask(sid, [input?.callID], false);
-        void heartbeat();
-      }
-      // answering a question resumes work
-      if (INPUT_TOOL.test(tool)) set(sid, "yellow");
-    },
-  };
-};
 
-export default TrafficLightPlugin;
+  await ctx.tool.hook("execute.before", (e) => {
+    const sid = (e && (e.sessionID || e.sessionId)) || "global";
+    const tool = (e && e.tool) || "";
+    if (TASK_TOOLS.has(tool)) trackTask(sid, [e?.id], true);
+    set(sid, INPUT_TOOL.test(tool) ? "red" : "yellow");
+  });
+
+  await ctx.tool.hook("execute.after", (e) => {
+    const sid = (e && (e.sessionID || e.sessionId)) || "global";
+    const tool = (e && e.tool) || "";
+    if (TASK_TOOLS.has(tool)) {
+      trackTask(sid, [e?.id], false);
+      void heartbeat();
+    }
+    // answering a question resumes work
+    if (INPUT_TOOL.test(tool)) set(sid, "yellow");
+  });
+
+  await ctx.permission.hook("evaluate", (e) => {
+    if (!e) return;
+    if (e.effect === "ask") {
+      set((e.sessionID || e.sessionId) || "global", "red");
+    }
+  });
+
+  const controller = new AbortController();
+  void (async () => {
+    try {
+      for await (const ev of ctx.event.subscribe({ signal: controller.signal })) {
+        try {
+          onEvent(ev);
+        } catch {}
+      }
+    } catch {}
+  })();
+
+  return () => controller.abort();
+}
+
+export default { id: "traffic-light", setup };
+export { setup, onEvent, aggregate, localStates, activeTasks };
